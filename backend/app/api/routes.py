@@ -9,6 +9,7 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 from app.db.database import get_db
+from app.core.config import settings
 from app.models import entities as db_models
 from app.schemas import entities as schemas
 from app.core.security import (
@@ -110,13 +111,22 @@ def signup(payload: schemas.UserCreate, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    # First user bootstrap as admin
+    # First user bootstrap as admin; otherwise allow role=admin only with the
+    # shared ADMIN_SIGNUP_CODE from settings. Everything else defaults to user.
     is_first = db.query(db_models.User).count() == 0
+    wants_admin = (payload.role or "user").lower() == "admin"
+    admin_ok = wants_admin and payload.admin_code and payload.admin_code == settings.ADMIN_SIGNUP_CODE
+    if wants_admin and not admin_ok and not is_first:
+        raise HTTPException(status_code=403, detail="Invalid admin signup code.")
+
     user = db_models.User(
         email=payload.email,
         full_name=payload.full_name,
+        phone=payload.phone,
+        location=payload.location,
+        bio=payload.bio,
         hashed_password=hash_password(payload.password),
-        is_admin=is_first,
+        is_admin=is_first or admin_ok,
     )
     db.add(user)
     db.commit()

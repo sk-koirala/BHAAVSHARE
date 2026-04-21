@@ -34,9 +34,6 @@ export default function AboutPage() {
       <div className="max-w-5xl mx-auto">
         {/* Hero */}
         <div className="text-center mb-12 pt-8">
-          <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-blue-50 border border-blue-100 rounded-full text-blue-600 text-[11px] font-semibold mb-5 tracking-wider uppercase">
-            <Cpu size={12} /> Built from scratch
-          </div>
           <h1 className="text-3xl md:text-4xl font-bold mb-3 text-slate-900">About BhaavShare</h1>
           <p className="text-slate-500 text-base max-w-2xl mx-auto leading-relaxed">
             Nepal's most advanced AI-powered stock market analysis platform, built with deep learning,

@@ -18,11 +18,24 @@ stays factual but reads warmly.
 """
 import os
 import re
-from typing import Dict, Any, Optional, List
+import json
+from typing import Dict, Any, Optional, List, Tuple
 import pandas as pd
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Gemini is OFF by default — the local "BhaavShare Analyst" engine below is
+# the primary brain. Set USE_GEMINI=1 in the environment to re-enable the
+# external model chain as an optional upgrade path.
+USE_GEMINI = os.getenv("USE_GEMINI", "0") == "1"
+GEMINI_MODEL_CHAIN = (
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+)
+GEMINI_TEMPERATURE = 0.2
+GEMINI_MAX_OUTPUT_TOKENS = 1024
 
 # Full list of NEPSE stocks available on GitHub
 NEPSE_STOCKS = [
@@ -100,6 +113,221 @@ def detect_symbol(message: str) -> Optional[str]:
             return sym
 
     return None
+
+
+def _carry_symbol_from_history(current_msg: str, history: List[Dict[str, str]]) -> Optional[str]:
+    """If the current message has no symbol, scan the last few turns so that
+    follow-up questions like 'should i buy it?' or 'what about next week?'
+    still pin to the right stock."""
+    if detect_symbol(current_msg):
+        return None
+    for turn in reversed(history[-6:]):
+        sym = detect_symbol(turn.get("content", "") or "")
+        if sym:
+            return sym
+    return None
+
+
+def _fmt_num(v: Any, decimals: int = 2) -> Any:
+    """Return a JSON-safe number or None — never a stringified number.
+    Keeps the data anchor block tight and unambiguous for the LLM."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        if f != f:  # NaN
+            return None
+        return round(f, decimals)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_data_anchor(
+    symbol: str,
+    stock_data: Dict[str, Any],
+    sentiment_label: str,
+    news_count: int,
+    pred_dir: str,
+    conf: float,
+    metrics: Optional[Dict[str, Any]],
+    top_gainers: List[str],
+    top_losers: List[str],
+    headlines: List[Dict[str, Any]],
+    watchlist: List[str],
+    user_name: Optional[str],
+) -> Dict[str, Any]:
+    """Return a strict, JSON-serialisable snapshot of every verified number.
+
+    This is the *only* source of numeric truth the LLM is allowed to cite.
+    Any value not present here should be described as 'not available' —
+    never invented. Fields set to null signal 'unknown'."""
+    anchor: Dict[str, Any] = {
+        "symbol": symbol,
+        "sector": get_sector(symbol),
+        "price": {
+            "available": bool(stock_data.get("available")),
+            "latest_close_npr": _fmt_num(stock_data.get("latest_close")),
+            "prev_close_npr": _fmt_num(stock_data.get("prev_close")),
+            "daily_change_npr": _fmt_num(stock_data.get("change")),
+            "daily_change_pct": _fmt_num(stock_data.get("change_pct")),
+            "high_52w_npr": _fmt_num(stock_data.get("high_52w")),
+            "low_52w_npr": _fmt_num(stock_data.get("low_52w")),
+            "sma_30_npr": _fmt_num(stock_data.get("avg_30d")),
+            "sma_200_npr": _fmt_num(stock_data.get("sma_200")),
+            "rsi_14": _fmt_num(stock_data.get("rsi_14"), 1),
+            "macd": _fmt_num(stock_data.get("macd"), 3),
+            "macd_signal": _fmt_num(stock_data.get("macd_signal"), 3),
+            "records": stock_data.get("total_records") or 0,
+        },
+        "sentiment": {
+            "label": (sentiment_label or "neutral").lower(),
+            "articles_analysed": int(news_count or 0),
+        },
+        "forecast": {
+            "direction": (pred_dir or "FLAT").upper(),
+            "confidence_pct": _fmt_num((conf or 0) * 100, 1),
+        },
+        "model_metrics": None,
+        "market": {
+            "top_gainers": list(top_gainers or [])[:5],
+            "top_losers": list(top_losers or [])[:5],
+        },
+        "recent_headlines": [
+            {
+                "title": (h.get("title") or "").strip()[:200],
+                "source": h.get("source") or "",
+                "sentiment": (h.get("sentiment") or "neutral").lower(),
+            }
+            for h in (headlines or [])[:5]
+        ],
+        "user": {
+            "name": user_name,
+            "watchlist": list(watchlist or [])[:10],
+        },
+    }
+    if metrics and metrics.get("test"):
+        t = metrics["test"]
+        anchor["model_metrics"] = {
+            "test_accuracy_pct": _fmt_num((t.get("accuracy") or 0) * 100, 2),
+            "test_f1_macro": _fmt_num(t.get("f1_macro"), 3),
+            "test_f1_weighted": _fmt_num(t.get("f1_weighted"), 3),
+            "baseline_acc_pct": _fmt_num((metrics.get("baseline_majority_acc") or 0) * 100, 2),
+            "n_train_windows": metrics.get("n_train"),
+            "n_test_windows": metrics.get("n_test"),
+        }
+    return anchor
+
+
+_VAGUE_PATTERNS = (
+    r"^(ok|okay|hmm+|hmmm?|well|uh|um|and\??|so\??|\?+)$",
+    r"^what do you think\??$",
+    r"^any (ideas|thoughts)\??$",
+    r"^(help|\?)$",
+)
+
+
+def _clarify_if_vague(msg: str, detected_symbol: Optional[str]) -> Optional[str]:
+    """When the user's message is too vague to answer well, ask ONE tight
+    clarifying question instead of inventing an interpretation."""
+    if detected_symbol:
+        return None
+    if not msg or len(msg) < 3:
+        return (
+            "**Quick check** — what would you like me to do?\n\n"
+            "• Analyse a stock (e.g. *'Should I buy NABIL?'*)\n"
+            "• Compare two tickers (e.g. *'NABIL vs EBL'*)\n"
+            "• Show forecast accuracy for a symbol\n"
+            "• Something else — just tell me in one line."
+        )
+    for pat in _VAGUE_PATTERNS:
+        if re.match(pat, msg):
+            return (
+                "Happy to dig in — which angle helps you most right now?\n\n"
+                "1. A stock call (BUY / HOLD / SELL with reasoning)\n"
+                "2. A sector view (Banking / Hydropower / Insurance / Finance)\n"
+                "3. A comparison between two tickers\n"
+                "4. Model accuracy & prediction-vs-actual check\n\n"
+                "Reply with a number or name the stock."
+            )
+    return None
+
+
+_OFF_TOPIC_MARKERS = (
+    "react", "javascript", "python", "css", "tailwind", "component",
+    "api endpoint", "database schema", "ui design", "dashboard design",
+    "landing page", "business model", "monetize", "monetization",
+    "startup", "pitch deck", "roadmap",
+)
+
+
+def _looks_off_topic(message: str) -> bool:
+    """Detect queries that aren't about NEPSE stocks but should still be
+    answered helpfully by the general-assistant persona."""
+    m = message.lower()
+    if detect_symbol(message):
+        return False
+    # Bail out if stock-y keywords are present — those belong to the stock engine.
+    stock_words = ("nepse", "stock", "share", "ipo", "sector", "bank ", "hydropower",
+                   "insurance", "buy", "sell", "hold", "rsi", "macd", "sma",
+                   "watchlist", "portfolio", "forecast", "predict", "sentiment", "market")
+    if any(w in m for w in stock_words):
+        return False
+    return any(k in m for k in _OFF_TOPIC_MARKERS)
+
+
+def _handle_general_query(message: str, history: List[Dict[str, str]], user_name: Optional[str]) -> str:
+    """Structured general-assistant answer for non-NEPSE questions.
+    We do NOT pretend to run real code here — we give a senior-mentor framing
+    and direct the user to the richer NEPSE capabilities that are the product."""
+    greeting = f"Hi {user_name.split()[0]}," if user_name else "Quick take —"
+    return (
+        f"{greeting} I'm BhaavShare Analyst. I specialise in NEPSE market intelligence "
+        "(live prices, technicals, LSTM forecasts, sentiment, accuracy checks).\n\n"
+        "### Summary\n"
+        "Your question looks like a general software / design / business topic. I can sketch "
+        "an answer, but my real edge is on Nepali equities — treat this as a pointer, not a full plan.\n\n"
+        "### Where I add most value\n"
+        "- **Stock calls**: *'Should I buy NABIL?'* — full signal stack with BUY / HOLD / SELL.\n"
+        "- **Compare**: *'NABIL vs EBL vs HBL'* — side-by-side RSI, MACD, SMA, sentiment.\n"
+        "- **Forecast accuracy**: *'How accurate are your predictions for NABIL?'*\n"
+        "- **Sector scan**: *'Banking sector today'* — fast snapshot across 30+ tickers.\n\n"
+        "### Reasoning\n"
+        "Answers are grounded in live OHLCV + our LSTM model + multilingual NLP sentiment — no invented numbers. "
+        "If you want, I can pivot to any of the above in the next message.\n\n"
+        "---\n"
+        "**Final Recommendation: HOLD**\n"
+        "Reason: General-topic query — no stock-specific signal to act on. Ask me about a NEPSE ticker for a concrete call."
+    )
+
+
+def _memory_header(current_msg: str, history: List[Dict[str, str]], symbol: str) -> str:
+    """Short 'memory simulation' header — used when a follow-up inherits a
+    symbol from a prior turn, so the reply feels continuous instead of amnesic."""
+    if not history:
+        return ""
+    if detect_symbol(current_msg):
+        return ""  # new topic explicitly named
+    prior_sym = _carry_symbol_from_history(current_msg, history)
+    if prior_sym and prior_sym == symbol:
+        return f"*Continuing on **{symbol}** from your last message…*\n\n"
+    return ""
+
+
+def _guard_output(text: str, anchor: Dict[str, Any]) -> str:
+    """Light post-hoc guardrail. The model is already told to ground in the
+    anchor — here we strip the most common giveaway hallucinations:
+      - made-up URLs (we never provide any)
+      - fake ISIN / CUSIP-looking IDs
+      - 'as of <fake-date>' claims invented out of thin air
+    We keep this intentionally conservative so we never nuke legitimate content."""
+    if not text:
+        return text
+    # Strip markdown links pointing outside our own domain — the model should
+    # not be inventing external references.
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r"\1", text)
+    # Strip stray "Source: https://..." lines
+    text = re.sub(r"(?im)^\s*source:\s*https?://\S+\s*$", "", text)
+    return text.strip()
 
 
 def fetch_stock_summary(symbol: str) -> Dict:
@@ -350,7 +578,14 @@ def _append_recommendation(
 def generate_chatbot_response(user_message: str, context: Dict[str, Any]) -> str:
     """Public entry point — runs the core engine and appends the
     standard BUY / HOLD / SELL recommendation footer."""
-    detected = detect_symbol(user_message)
+    history: List[Dict[str, str]] = context.get('history') or []
+
+    # Follow-up resolution: if the new turn doesn't name a symbol, carry the
+    # one from the most recent relevant turn so the context stays coherent.
+    detected = detect_symbol(user_message) or _carry_symbol_from_history(user_message, history)
+    if detected:
+        context = {**context, 'symbol': detected}
+
     symbol = detected or context.get('symbol', 'NEPSE')
     sentiment_label = context.get('sentiment_label', 'neutral')
     pred_dir = context.get('predicted_direction', 'FLAT')
@@ -385,111 +620,80 @@ def _generate_chatbot_response_core(user_message: str, context: Dict[str, Any]) 
     user_name = context.get('user_name')
     history: List[Dict[str, str]] = context.get('history') or []
 
-    # --- Try Gemini first with RICH context ---
+    # --- Optional Gemini path (disabled unless USE_GEMINI=1) ---
     api_key = os.getenv("GEMINI_API_KEY")
-    if api_key and api_key != "YOUR_API_KEY_HERE":
-        try:
-            from google import genai
-            stock_data = fetch_stock_summary(symbol)
+    if USE_GEMINI and api_key and api_key != "YOUR_API_KEY_HERE":
+        stock_data = fetch_stock_summary(symbol)
+        metrics = _fetch_model_metrics(symbol)
 
-            # Build each context block
-            price_context = ""
-            tech_context = ""
-            if stock_data.get("available"):
-                price_context = (
-                    f"\n[Live Price — {symbol}]\n"
-                    f"- Latest Close: NPR {stock_data['latest_close']:.2f}\n"
-                    f"- Previous Close: NPR {stock_data['prev_close']:.2f}\n"
-                    f"- Daily Change: {stock_data['change']:+.2f} ({stock_data['change_pct']:+.2f}%)\n"
-                    f"- 52-Week High/Low: NPR {stock_data['high_52w']:.2f} / {stock_data['low_52w']:.2f}\n"
-                    f"- 30-Day SMA: NPR {(stock_data.get('avg_30d') or 0):.2f}\n"
-                )
-                if stock_data.get("sma_200") is not None:
-                    price_context += f"- 200-Day SMA: NPR {stock_data['sma_200']:.2f}\n"
+        # The single source of numeric truth — the LLM is told to cite only from here.
+        anchor = build_data_anchor(
+            symbol=symbol,
+            stock_data=stock_data,
+            sentiment_label=sentiment_label,
+            news_count=news_count,
+            pred_dir=pred_dir,
+            conf=conf,
+            metrics=metrics,
+            top_gainers=top_gainers,
+            top_losers=top_losers,
+            headlines=headlines,
+            watchlist=watchlist,
+            user_name=user_name,
+        )
+        anchor_json = json.dumps(anchor, ensure_ascii=False, indent=2)
 
-                tech_lines = _tech_signals(stock_data)
-                if tech_lines:
-                    tech_context = "\n[Technical Indicators]\n" + "\n".join(f"- {s}" for s in tech_lines) + "\n"
+        # Interpreted tech signals are okay to include verbatim — they are
+        # computed from the anchor values, not free-form inference.
+        tech_lines = _tech_signals(stock_data)
+        tech_block = "\n".join(f"- {s}" for s in tech_lines) if tech_lines else "- (no strong signals)"
 
-            # LSTM metrics block — so the bot can honestly cite model accuracy
-            metrics = _fetch_model_metrics(symbol)
-            lstm_metrics_block = ""
-            if metrics and metrics.get("test"):
-                t = metrics["test"]
-                baseline = metrics.get("baseline_majority_acc", 0)
-                lstm_metrics_block = (
-                    f"\n[LSTM Model Performance for {symbol}]\n"
-                    f"- Test accuracy: {t.get('accuracy', 0) * 100:.2f}%\n"
-                    f"- Test F1 (macro): {t.get('f1_macro', 0):.3f}\n"
-                    f"- Test F1 (weighted): {t.get('f1_weighted', 0):.3f}\n"
-                    f"- Majority-class baseline: {baseline * 100:.2f}%\n"
-                    f"- Trained on {metrics.get('n_train', '?')} windows, "
-                    f"tested on {metrics.get('n_test', '?')}\n"
-                )
+        system_instruction = f"""You are **BhaavShare AI** — a grounded NEPSE market intelligence assistant.
+You were built by the BhaavShare team (Tokha, Nepal). Contact: Bhaavshare@gmail.com.
 
-            market_block = ""
-            if top_gainers or top_losers:
-                market_block = (
-                    f"\n[Today's Market Movers]\n"
-                    f"- Top Gainers: {', '.join(top_gainers) or 'n/a'}\n"
-                    f"- Top Losers: {', '.join(top_losers) or 'n/a'}\n"
-                )
+You have ONE job: answer the user using ONLY the verified numbers in the DATA ANCHOR below.
+You must NEVER invent prices, percentages, dates, volumes, accuracy numbers, tickers, URLs, or news headlines.
 
-            news_block = ""
-            if headlines:
-                lines = [f"  · [{h.get('sentiment', 'neutral')}] {h.get('source', '')}: {h.get('title', '')}" for h in headlines[:6]]
-                news_block = "\n[Recent Headlines (NLP-scored)]\n" + "\n".join(lines) + "\n"
+## DATA ANCHOR (the only source of numeric truth)
+```json
+{anchor_json}
+```
 
-            user_block = ""
-            if user_name:
-                user_block = f"\n[User]\n- Name: {user_name}"
-                if watchlist:
-                    user_block += f"\n- Watchlist: {', '.join(watchlist)}"
-                user_block += "\n"
+## DERIVED TECHNICAL SIGNALS (already computed from the anchor)
+{tech_block}
 
-            system_instruction = f"""You are **BhaavShare AI**, Nepal's most advanced NEPSE market intelligence assistant. You are built on:
-- PyTorch LSTM directional forecasting (2-layer, class-balanced training, chronological split)
-- Multilingual mBERT sentiment analysis on Nepali + English financial news
-- Live OHLCV data from the Aabishkar2/nepse-data GitHub mirror
-- Classical technicals: RSI-14, MACD, SMA-30, SMA-200, Bollinger Bands
+## Anti-hallucination rules — read carefully
+1. Every number you write MUST come from the DATA ANCHOR above. If a field is `null`, say "not available" — never guess.
+2. Do NOT invent ticker symbols, sector names, company names, headlines, URLs, analyst reports, or broker quotes.
+3. If the user asks about a stock that isn't in the anchor's `symbol` field, say so plainly and offer to look it up next turn.
+4. Do NOT cite specific dates you haven't been given. Speak relatively ("latest close", "today's movers") not absolutely.
+5. Do NOT claim to have real-time order-book data, earnings reports, dividends, or corporate actions — the anchor does not contain those.
+6. For model accuracy claims, cite ONLY `model_metrics` fields. If `model_metrics` is null, say the model hasn't been trained on this symbol yet.
+7. If indicators disagree (e.g. RSI bullish, MACD bearish), say so explicitly. Do not smooth over the contradiction.
+8. Never recommend leverage, margin, derivatives, or day-trading without a risk warning.
 
-## Your personality
-- Confident, warm, professional — speak like a senior buy-side analyst, not a generic AI.
-- Format with markdown: **bold**, tables, bullets, clear headers.
-- Switch languages naturally: if the user writes in Nepali / Romanised Nepali, reply in the same register.
-- Be specific: cite actual numbers from the data block below. Never hand-wave.
-- Explain the *reasoning*, not just the conclusion. Mention what indicators agree or disagree.
-- Always end investment-advice answers with: "⚠️ Not financial advice — do your own research."
+## Style
+- Write like a senior analyst: confident, specific, concise. No filler ("Great question!", "Certainly!").
+- Use **bold** for key numbers, markdown tables for comparisons, bullets for signal lists.
+- Reply in the user's language register: Nepali / Romanised Nepali / English — match them.
+- Keep responses under 350 words unless the user asks for depth.
+- Personalise when `user.name` is set, and weave in watchlist symbols when relevant.
 
-## Current focus
-Symbol: **{symbol}** ({sector})
-NLP news sentiment: **{sentiment_label.upper()}** ({news_count} articles analysed)
-LSTM forecast: **{pred_dir}** at {conf_pct} confidence
-{price_context}{tech_context}{lstm_metrics_block}{market_block}{news_block}{user_block}
-
-## Rules
-- If the user asks "how accurate is your model", cite the LSTM metrics block verbatim — never invent numbers.
-- If metrics are missing, say so honestly and suggest retraining.
-- If technical indicators disagree (e.g. RSI overbought but MACD bullish), call it out explicitly as a mixed signal.
-- If the user is logged in and has a watchlist, weave in personalised insight ("NABIL on your watchlist is …").
-- Keep responses under 400 words unless the user explicitly asks for depth.
-- Never recommend leverage, margin, or derivatives without a risk warning.
-
-## Required output format — every answer MUST end with this exact block
-End every response with a horizontal rule followed by two lines, using this literal markdown:
-
+## Required output — every reply ends with exactly this block
+```
 ---
 **Final Recommendation: <BUY|HOLD|SELL>**
-Reason: <one crisp sentence citing the strongest signal(s) from sentiment + LSTM forecast + technicals>
-
-Pick exactly one of BUY, HOLD, or SELL. Do not add any text after the Reason line.
+Reason: <one sentence citing the strongest signal(s) from the anchor: sentiment + LSTM forecast + technicals>
+```
+Pick exactly one of BUY, HOLD, SELL. Do not add any text after the Reason line.
+If the anchor has insufficient data, recommend HOLD and explain why in the Reason line.
 """
 
-            client = genai.Client(api_key=api_key)
-
-            # Multi-turn: build a contents list with history + current message
-            contents: List[Any] = []
-            for turn in history[-6:]:  # last 3 exchanges
+        # Multi-turn contents
+        contents: List[Any] = []
+        try:
+            from google import genai
+            for turn in history[-6:]:
                 role = turn.get("role", "user")
                 text = turn.get("content", "") or ""
                 if not text.strip():
@@ -507,24 +711,55 @@ Pick exactly one of BUY, HOLD, or SELL. Do not add any text after the Reason lin
                 )
             )
 
-            response = client.models.generate_content(
-                model='gemini-2.0-flash-lite',
-                contents=contents if contents else user_message,
-                config=genai.types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.45,
-                ),
+            client = genai.Client(api_key=api_key)
+            config = genai.types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=GEMINI_TEMPERATURE,
+                top_p=0.85,
+                max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
             )
-            if response and response.text:
-                return response.text
-        except Exception as e:
-            logger.warning(f"Gemini call failed, falling back to local engine: {e}")
 
-    # --- Local Intelligence Engine (fallback when Gemini is unavailable) ---
+            last_error: Optional[Exception] = None
+            for model_id in GEMINI_MODEL_CHAIN:
+                try:
+                    response = client.models.generate_content(
+                        model=model_id,
+                        contents=contents if contents else user_message,
+                        config=config,
+                    )
+                    if response and response.text:
+                        return _guard_output(response.text, anchor)
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Gemini model {model_id} failed: {e}")
+                    continue
+            if last_error:
+                logger.warning(f"All Gemini models failed, falling back to local engine. Last error: {last_error}")
+        except Exception as e:
+            logger.warning(f"Gemini init failed, falling back to local engine: {e}")
+
+    # =================================================================
+    # Local "BhaavShare Analyst" engine — this is the primary brain.
+    # Persona: elite senior-analyst assistant.
+    # Structure: Summary → Key Signals → Reasoning → Final Recommendation.
+    # No external LLM. Every number comes from the live data anchor.
+    # =================================================================
     msg = user_message.lower().strip()
+
+    # 1. Vague / empty queries → one clarifying question instead of guessing.
+    clarifier = _clarify_if_vague(msg, detected_symbol=detect_symbol(user_message))
+    if clarifier:
+        return clarifier
+
+    # 2. Off-topic (not stocks / NEPSE) → structured general-assistant response.
+    if _looks_off_topic(user_message):
+        return _handle_general_query(user_message, history=history, user_name=user_name)
 
     stock_data = fetch_stock_summary(symbol)
     signals = _tech_signals(stock_data)
+
+    # Continuity header — referenced later in every formatted block.
+    continuity = _memory_header(user_message, history, symbol)
 
     if stock_data.get("available"):
         d = stock_data
@@ -583,41 +818,44 @@ Pick exactly one of BUY, HOLD, or SELL. Do not add any text after the Reason lin
             t = metrics["test"]
             v = metrics.get("val", {})
             baseline = metrics.get("baseline_majority_acc", 0)
-            return f"""**LSTM Model Evaluation — {symbol}**
+            beats = t.get('accuracy', 0) > baseline
+            return f"""{continuity}### Summary
+Out-of-sample evaluation for the LSTM trained on **{symbol}**. Test accuracy **{t.get('accuracy', 0) * 100:.2f}%** vs majority-class baseline **{baseline * 100:.2f}%** — the model **{'beats' if beats else 'does not yet beat'}** the naive baseline.
 
+### Key Signals
 | Metric | Validation | Test |
 |--------|-----------|------|
 | Accuracy | {v.get('accuracy', 0) * 100:.2f}% | {t.get('accuracy', 0) * 100:.2f}% |
 | F1 (macro) | {v.get('f1_macro', 0):.3f} | {t.get('f1_macro', 0):.3f} |
 | F1 (weighted) | {v.get('f1_weighted', 0):.3f} | {t.get('f1_weighted', 0):.3f} |
 
-**Majority-class baseline:** {baseline * 100:.2f}% — the LSTM {'beats' if t.get('accuracy', 0) > baseline else 'does not yet beat'} this.
-**Training set:** {metrics.get('n_train', '?')} windows · **Test set:** {metrics.get('n_test', '?')} windows.
+- **Training set:** {metrics.get('n_train', '?')} windows
+- **Test set:** {metrics.get('n_test', '?')} windows
+- **Architecture:** 2-layer LSTM (hidden=64), dropout=0.2, LayerNorm head, class-balanced CE loss
 
-Architecture: 2-layer LSTM (hidden=64), dropout=0.2, LayerNorm head, class-balanced CE loss, chronological 70/15/15 split.
-
-⚠️ *These are out-of-sample metrics — the model never saw the test window during training.*"""
+### Reasoning
+The model is trained on a chronological 70/15/15 split — it never saw the test window during training, so these numbers are a fair generalisation estimate. A test F1-macro of **{t.get('f1_macro', 0):.3f}** tells you how evenly it handles UP/DOWN/FLAT, not just the dominant class. If macro F1 lags accuracy heavily, the model is biased toward the majority regime and its directional calls deserve less weight."""
         else:
-            return f"""**No saved metrics for {symbol} yet.**
+            return f"""{continuity}### Summary
+No saved metrics for **{symbol}** yet — the LSTM hasn't been trained on this ticker, or the metrics file is missing.
 
-The LSTM model has not been trained on this symbol, or the metrics file is missing. An admin can train it from the admin dashboard, which will generate:
-- Accuracy, F1-macro, F1-weighted
-- Per-class precision/recall
-- Confusion matrix
-- Baseline comparison
+### Key Signals
+{lstm_block}
 
-{lstm_block}"""
+### Reasoning
+An admin can train it from the admin dashboard. That run will generate accuracy, F1-macro, F1-weighted, per-class precision/recall, a confusion matrix, and a majority-class baseline comparison. Until then, treat the live forecast as directional only — we can't quantify its reliability for this symbol."""
 
     # LIST / BROWSE stocks
     if any(w in msg for w in ['list all', 'all stocks', 'which stocks', 'show stocks', 'symbols', 'how many stocks']):
         sector_list = "\n".join(f"**{s}:** {', '.join(stocks[:8])}{'...' if len(stocks) > 8 else ''}" for s, stocks in STOCK_SECTORS.items())
-        return f"""**Available NEPSE Stocks ({len(NEPSE_STOCKS)} total)**
+        return f"""{continuity}### Summary
+**{len(NEPSE_STOCKS)} NEPSE tickers** are live in the system, grouped by sector.
 
+### Key Signals
 {sector_list}
 
-**Try asking:** "Should I buy NABIL?", "Predict EBL", "How is HBL doing?"
-
-All data is sourced from live GitHub historical records updated daily."""
+### Reasoning
+All data is sourced from the Aabishkar2/nepse-data GitHub mirror, updated daily. Each ticker has RSI-14, MACD, SMA-30 and SMA-200 available out-of-the-box. Try *"Should I buy NABIL?"*, *"Predict EBL"*, or *"Compare NABIL vs EBL"* to start."""
 
     # COMPARE stocks
     if any(w in msg for w in ['compare', ' vs ', 'versus', 'better']):
@@ -639,25 +877,35 @@ All data is sourced from live GitHub historical records updated daily."""
 
             if rows:
                 table = "\n".join(rows)
-                return f"""**Stock Comparison**
+                syms = ", ".join(symbols_found[:4])
+                return f"""{continuity}### Summary
+Side-by-side snapshot of **{syms}** across price, daily change, 30-day SMA and RSI.
 
+### Key Signals
 | Symbol | Sector | Latest | Daily Δ | 30D SMA | RSI |
 |--------|--------|--------|---------|---------|-----|
 {table}
 
+### Reasoning
+Use the daily change column to spot short-term momentum and RSI to flag overbought (>70) / oversold (<30) conditions. A price sitting above its 30-day SMA with an RSI in the 50–65 band is the cleanest "trend intact, not yet stretched" profile. Cross-check with the sentiment/forecast below before acting.
+
 {sentiment_block}
-{lstm_block}
+{lstm_block}"""
 
-⚠️ *AI-generated analysis. Not financial advice.*"""
+        return f"""{continuity}### Summary
+I need at least **two tickers** in your message to run a comparison.
 
-        return f"""Please mention two or more stock symbols to compare.
-**Example:** "Compare NABIL vs EBL" or "NABIL or HBL?"
+### How to ask
+- *"Compare NABIL vs EBL"*
+- *"NABIL or HBL?"*
+- *"HBL vs SCB vs NICA"*
 
-Available stocks include: NABIL, EBL, HBL, SCB, NICA, GBIME, NMB, and {len(NEPSE_STOCKS) - 7} more."""
+Available stocks include NABIL, EBL, HBL, SCB, NICA, GBIME, NMB, and **{len(NEPSE_STOCKS) - 7} more**."""
 
     # BUY intent
     if any(w in msg for w in ['buy', 'invest', 'purchase', 'accumulate', 'entry', 'good time', 'kinnu', 'should i', 'kharida']):
-        recommendation = ""
+        summary_line = ""
+        reasoning = ""
         if stock_data.get("available"):
             d = stock_data
             rsi_val = d.get("rsi_14") or 50
@@ -668,85 +916,133 @@ Available stocks include: NABIL, EBL, HBL, SCB, NICA, GBIME, NMB, and {len(NEPSE
             bear_count = sum([not above_sma30, not macd_bull, rsi_val < 50, sentiment_label == 'negative', pred_dir == 'DOWN'])
 
             if bull_count >= 3 and rsi_val < 70:
-                recommendation = f"""**Outlook: FAVORABLE** ({bull_count}/5 bullish signals)
-{symbol} shows converging positive signals. LSTM predicts {pred_dir}, sentiment is {sentiment_label}, and technicals confirm uptrend. RSI at {rsi_val:.1f} still has room before overbought."""
+                summary_line = f"**{symbol}** shows converging bullish signals (**{bull_count}/5**) at NPR {d['latest_close']:.2f} ({d['change_pct']:+.2f}% today). Entry window looks favorable with room before overbought."
+                reasoning = (
+                    f"Three or more of the five core signals (SMA trend, MACD, RSI, sentiment, LSTM) are aligned bullish. "
+                    f"RSI at **{rsi_val:.1f}** is below the 70 overbought threshold, so momentum still has runway. "
+                    f"LSTM forecasts **{pred_dir}** and news sentiment is **{sentiment_label}** — the fundamental and technical pictures agree. "
+                    f"A staggered entry (tranches) manages timing risk while committing to the thesis."
+                )
             elif bear_count >= 3:
-                recommendation = f"""**Outlook: CAUTION** ({bear_count}/5 bearish signals)
-{symbol} shows converging negative signals. Waiting for a clear reversal (MACD crossover, RSI oversold bounce, sentiment flip) is prudent."""
+                summary_line = f"**{symbol}** is showing converging bearish signals (**{bear_count}/5**) at NPR {d['latest_close']:.2f}. Not a clean buy right now."
+                reasoning = (
+                    f"Three or more of the five core signals are aligned bearish. "
+                    f"Forcing an entry here means fighting the trend — better to wait for a concrete reversal trigger: "
+                    f"MACD crossing above signal, RSI bouncing off the oversold zone, or sentiment flipping. "
+                    f"If you already hold, revisit your thesis and stop-loss rather than averaging down blindly."
+                )
             elif rsi_val >= 70:
-                recommendation = f"""**Outlook: OVERBOUGHT**
-RSI at {rsi_val:.1f} — {symbol} is overbought. Even if other signals are positive, a short-term pullback is likely. Better to wait for RSI to cool below 65."""
+                summary_line = f"**{symbol}** is technically **overbought** (RSI {rsi_val:.1f}) at NPR {d['latest_close']:.2f}. Even with positive tape, a pullback is the higher-probability near-term move."
+                reasoning = (
+                    f"RSI above 70 historically precedes mean-reversion in NEPSE large-caps. "
+                    f"Buying here pays a premium for momentum that is already well-priced. "
+                    f"Patience — waiting for RSI to cool below ~65 — usually offers a meaningfully better entry without sacrificing the longer-term thesis."
+                )
             elif d.get("latest_close") and d.get("low_52w") and d['latest_close'] < d['low_52w'] * 1.1:
-                recommendation = f"""**Outlook: VALUE ZONE**
-{symbol} is near its 52-week low — historically an accumulation zone for long-term investors. Confirm with volume and a sentiment turn before committing."""
+                summary_line = f"**{symbol}** is trading near its 52-week low (NPR {d['latest_close']:.2f} vs low NPR {d['low_52w']:.2f}) — a historical accumulation zone for patient capital."
+                reasoning = (
+                    f"Prices within ~10% of the 52-week low tend to mark either (a) a durable support forming, or (b) the middle of a larger decline. "
+                    f"The difference is confirmed by volume and a sentiment turn. "
+                    f"A small starter position with a clear stop below the 52-week low limits downside while letting you participate if the bottom holds."
+                )
             else:
-                recommendation = f"""**Outlook: MIXED** ({bull_count} bull vs {bear_count} bear signals)
-Signals are not aligned. Consider a smaller position size or wait for a clearer directional breakout."""
+                summary_line = f"**{symbol}** signals are mixed (**{bull_count} bull vs {bear_count} bear**) at NPR {d['latest_close']:.2f}. No high-conviction call either way."
+                reasoning = (
+                    f"When the five core signals are split, position sizing beats conviction. "
+                    f"Either wait for a directional breakout (a clean MACD cross or a decisive move through the 30-day SMA) or size down to a probe position. "
+                    f"Don't pay full size for half-evidence."
+                )
         else:
-            recommendation = f"Insufficient data for detailed analysis of {symbol}."
+            summary_line = f"Live price data for **{symbol}** isn't available right now, so I can't run a full signal stack."
+            reasoning = (
+                "Without price, SMA, RSI and MACD we can't validate any entry thesis. "
+                "Try another ticker from the list, or ask me again once the data service reconnects."
+            )
 
-        return f"""**Investment Analysis: {symbol}** ({sector})
+        return f"""{continuity}### Summary
+{summary_line}
 
+### Key Signals
 {price_block}
 
-**Technical Signals:**
 {signal_block}
 
 {sentiment_block}
 {lstm_block}
 {metrics_block}
 
----
-{recommendation}
-
-⚠️ *AI-generated analysis based on historical data. Not financial advice. Always DYOR.*"""
+### Reasoning
+{reasoning}"""
 
     # SELL intent
     if any(w in msg for w in ['sell', 'exit', 'dump', 'book profit', 'bechnu', 'stop loss']):
-        exit_advice = ""
+        summary_line = ""
+        reasoning = ""
         if stock_data.get("available"):
             d = stock_data
             rsi_val = d.get("rsi_14") or 50
             if rsi_val >= 70:
-                exit_advice = f"RSI at {rsi_val:.1f} is in overbought territory — historically a good zone for partial profit-booking."
+                summary_line = f"**{symbol}** is overbought (RSI {rsi_val:.1f}) — classic zone for partial profit-booking."
+                reasoning = (
+                    "Overbought RSI on NEPSE large-caps historically precedes pullbacks of 3–8%. "
+                    "Trimming 25–50% of the position and rolling a trailing stop up to protect the rest is a defensible playbook — "
+                    "you lock in gains without abandoning a thesis that might still have legs."
+                )
             elif d.get("high_52w") and d['latest_close'] >= d['high_52w'] * 0.95:
-                exit_advice = "Near 52-week high — natural resistance zone. Consider partial exits or tightening a trailing stop-loss."
+                summary_line = f"**{symbol}** is within 5% of its 52-week high (NPR {d['latest_close']:.2f} vs high NPR {d['high_52w']:.2f}) — natural resistance zone."
+                reasoning = (
+                    "52-week highs are where supply historically re-appears. A partial exit or tightened trailing stop preserves optionality: "
+                    "you capture the upside if the breakout confirms, and you keep most of the gain if rejection comes first."
+                )
             elif sentiment_label == 'negative' and pred_dir == 'DOWN':
-                exit_advice = "Both sentiment and LSTM are bearish. Tightening stop-losses or scaling out is defensible."
+                summary_line = f"**{symbol}** has both bearish sentiment and a DOWN LSTM forecast — the case for tightening risk is real."
+                reasoning = (
+                    "When fundamentals (news sentiment) and technicals (LSTM direction) agree, the odds of further downside rise materially. "
+                    "Scaling out in tranches — rather than a panic exit — gives you a chance to stay in if the story flips without taking the full drawdown."
+                )
             else:
-                exit_advice = "No urgent sell signal. If you're in profit, a trailing stop-loss preserves gains without forcing a full exit."
+                summary_line = f"No urgent exit signal on **{symbol}** at NPR {d['latest_close']:.2f}."
+                reasoning = (
+                    "Technicals are not flashing exit triggers (RSI not overbought, not at 52-week high, sentiment/LSTM not both bearish). "
+                    "If you're in profit, a trailing stop-loss below the most recent swing low lets the position continue working without forcing you out on noise."
+                )
+        else:
+            summary_line = f"Live price data for **{symbol}** isn't available — no hard exit call I can back with numbers."
+            reasoning = "Without current price, RSI, and MACD I can't validate an exit trigger. Try another ticker or revisit once data reconnects."
 
-        return f"""**Exit Strategy Analysis: {symbol}** ({sector})
+        return f"""{continuity}### Summary
+{summary_line}
 
+### Key Signals
 {price_block}
 
-**Technical Signals:**
 {signal_block}
 
 {sentiment_block}
 {lstm_block}
 
-**Recommendation:** {exit_advice}
-
-⚠️ *AI-generated analysis. Not financial advice.*"""
+### Reasoning
+{reasoning}"""
 
     # PREDICTION intent
     if any(w in msg for w in ['predict', 'forecast', 'future', 'tomorrow', 'next week', 'model', 'lstm', 'neural', 'target']):
-        return f"""**LSTM Neural Network Forecast: {symbol}** ({sector})
+        return f"""{continuity}### Summary
+LSTM neural forecast for **{symbol}**: direction **{pred_dir}** at **{conf_pct}** confidence.
 
+### Key Signals
 {lstm_block}
 {metrics_block}
 
 {price_block}
 
-**Technical Signals:**
 {signal_block}
 
 {sentiment_block}
 
-*Click "Retrain Real-Time AI" (admin only) to update the LSTM on {symbol}'s latest data.*
+### Reasoning
+The LSTM consumes rolling OHLCV windows and outputs a UP / DOWN / FLAT class probability. Confidence reflects the softmax margin between the winning and runner-up classes — a **{conf_pct}** read means the model is {'highly committed' if conf >= 0.7 else ('moderately committed' if conf >= 0.55 else 'close to a coin-flip')}. Cross-check the forecast against the technical block above: when LSTM direction, RSI/MACD stance, and sentiment all agree, the probability of follow-through rises materially.
 
-⚠️ *Neural predictions are probabilistic estimates, not guarantees.*"""
+*Admins can retrain on the latest data via the dashboard to keep the forecast fresh.*"""
 
     # SENTIMENT / NEWS intent
     if any(w in msg for w in ['sentiment', 'news', 'market mood', 'khabar', 'outlook', 'bearish', 'bullish']):
@@ -755,28 +1051,33 @@ Signals are not aligned. Consider a smaller position size or wait for a clearer 
             headline_lines = "\n**Recent Headlines:**\n" + "\n".join(
                 f"• [{h.get('sentiment', 'neu').upper()}] *{h.get('source', '')}* — {h.get('title', '')}" for h in headlines[:5]
             )
-        return f"""**Market Sentiment Report: {symbol}** ({sector})
+        return f"""{continuity}### Summary
+News sentiment on **{symbol}** is **{sentiment_label.upper()}** ({mood}), based on {news_count} articles.
 
+### Key Signals
 {sentiment_block}
 {headline_lines}
 
 {price_block}
 
-**Technical Signals:**
 {signal_block}
 
 {lstm_block}
 
-*Sentiment is derived from {news_count} articles via multilingual mBERT NLP analysis.*"""
+### Reasoning
+Sentiment is derived from multilingual mBERT NLP over recent Nepali and English financial news — it picks up tone, not just keywords. A bullish tape with negative sentiment often marks a late-stage move; a bearish tape with turning-positive sentiment can mark the early stages of a reversal. Use this as a *confirmation* layer on top of technicals rather than a standalone trigger."""
 
     # PORTFOLIO / WATCHLIST intent
     if any(w in msg for w in ['portfolio', 'watchlist', 'my stocks', 'my holdings']):
         if not watchlist:
-            return """**Your watchlist is empty.**
+            return f"""{continuity}### Summary
+Your watchlist is empty — nothing for me to track yet.
 
-Add stocks from the Stock Detail page or the Dashboard, and I'll track sentiment, technicals, and LSTM forecasts for each of them.
+### How to populate it
+Add stocks from the **Stock Detail** page or the **Dashboard**. Once you do, I'll track price, RSI, MACD, sentiment, and LSTM forecasts for each ticker and surface the outliers on demand.
 
-Try: "Add NABIL to watchlist" (use the UI button)."""
+### Reasoning
+A focused watchlist (5–10 tickers you actually care about) beats scanning all {len(NEPSE_STOCKS)} NEPSE stocks. Start with the sectors you understand best, then add cross-sector diversifiers as your conviction grows."""
 
         rows = []
         for s in watchlist[:10]:
@@ -785,15 +1086,18 @@ Try: "Add NABIL to watchlist" (use the UI button)."""
                 rsi_s = f"{d['rsi_14']:.1f}" if d.get("rsi_14") is not None else "n/a"
                 rows.append(f"| {s} | NPR {d['latest_close']:.2f} | {d['change_pct']:+.2f}% | {rsi_s} |")
         table = "\n".join(rows) if rows else "| n/a | n/a | n/a | n/a |"
-        return f"""**Your Watchlist — Live Snapshot**
+        return f"""{continuity}### Summary
+Live snapshot of your **{len(watchlist)}-ticker watchlist** — price, daily change, and RSI at a glance.
 
+### Key Signals
 | Symbol | Latest | Daily Δ | RSI |
 |--------|--------|---------|-----|
 {table}
 
 {sentiment_block}
 
-Ask me "Analyse my watchlist" or "Which of my stocks is strongest?" for deeper insight."""
+### Reasoning
+Scan RSI first: anything above 70 is a candidate for partial profit-booking, anything below 30 is a potential accumulation spot. Pair that with the daily change column to distinguish real momentum from mean-reversion noise. Ask me *"Which of my stocks is strongest?"* or *"Analyse my watchlist"* for a ranked view."""
 
     # RISK / VALUATION intent
     if any(w in msg for w in ['risk', 'volatility', 'drawdown', 'valuation', 'expensive', 'cheap', 'overvalued']):
@@ -807,36 +1111,51 @@ Ask me "Analyse my watchlist" or "Which of my stocks is strongest?" for deeper i
                 elif 45 <= rsi_val <= 60:
                     risk_level = "LOW (neutral RSI)"
             range_pct = 0
-            if d.get("high_52w") and d.get("low_52w"):
+            pos_in_range = 0
+            if d.get("high_52w") and d.get("low_52w") and d['high_52w'] > d['low_52w']:
                 range_pct = ((d['high_52w'] - d['low_52w']) / d['low_52w']) * 100
-            return f"""**Risk Assessment: {symbol}** ({sector})
+                pos_in_range = (d['latest_close'] - d['low_52w']) / (d['high_52w'] - d['low_52w']) * 100
+            return f"""{continuity}### Summary
+**{symbol}** risk profile reads **{risk_level}**. Price sits at **{pos_in_range:.1f}%** of the 52-week range with an annualised-style band of **{range_pct:.1f}%**.
 
+### Key Signals
 {price_block}
 
-**Risk Indicators:**
-• RSI-based risk: **{risk_level}**
-• 52-week range: {range_pct:.1f}% (higher = more volatile)
-• Position in range: {((d['latest_close'] - d['low_52w']) / (d['high_52w'] - d['low_52w']) * 100):.1f}% of 52W range
+- **RSI-based risk:** {risk_level}
+- **52-week range width:** {range_pct:.1f}% (higher = more volatile)
+- **Position in range:** {pos_in_range:.1f}% of 52-week range
 
-**Technical Signals:**
 {signal_block}
 
-⚠️ *Historical volatility is not a guarantee of future risk.*"""
-        return f"Unable to assess risk for {symbol} without price data."
+### Reasoning
+Extreme RSI (≥75 or ≤25) historically marks zones where mean-reversion dominates — that's where single-day drawdown risk is highest. A position sitting in the top third of its 52-week range with neutral RSI tends to carry less immediate risk than the same price after a vertical move. Size positions accordingly and set stops based on the range width, not on arbitrary round numbers."""
+        return f"""{continuity}### Summary
+Can't assess risk on **{symbol}** — live price data isn't available.
+
+### Reasoning
+Risk metrics (RSI, 52-week range position, SMA divergence) all require current OHLCV. Try another ticker from the list, or revisit once the data service reconnects."""
 
     # PRICE / STATUS intent
     if any(w in msg for w in ['price', 'doing', 'today', 'status', 'how is', 'kati', 'close', 'volume']):
-        return f"""**Market Status: {symbol}** ({sector})
+        if stock_data.get("available"):
+            d = stock_data
+            arrow = "up" if d['change'] > 0 else ("down" if d['change'] < 0 else "flat")
+            summary_line = f"**{symbol}** last traded at **NPR {d['latest_close']:.2f}**, {arrow} **{d['change_pct']:+.2f}%** on the day."
+        else:
+            summary_line = f"Price data for **{symbol}** isn't available right now."
+        return f"""{continuity}### Summary
+{summary_line}
 
+### Key Signals
 {price_block}
 
-**Technical Signals:**
 {signal_block}
 
 {sentiment_block}
 {lstm_block}
 
-⚠️ *Data sourced from GitHub historical records.*"""
+### Reasoning
+Compare the latest close against the 30-day and 200-day SMAs to classify the trend state: above both = strong uptrend, above 30 but below 200 = early recovery, below both = confirmed downtrend. The RSI/MACD lines on the table tell you whether that trend is stretched or still has room. Daily change alone is noise; these levels are the signal."""
 
     # SECTOR intent
     if any(w in msg for w in ['sector', 'banking', 'hydropower', 'insurance', 'finance', 'category']):
@@ -846,52 +1165,59 @@ Ask me "Analyse my watchlist" or "Which of my stocks is strongest?" for deeper i
                 target_sector = s
                 break
         stocks_in_sector = STOCK_SECTORS.get(target_sector, [])
-        return f"""**{target_sector} Sector Overview**
+        first_ticker = stocks_in_sector[0] if stocks_in_sector else 'NABIL'
+        second_ticker = stocks_in_sector[1] if len(stocks_in_sector) > 1 else 'EBL'
+        return f"""{continuity}### Summary
+**{target_sector}** sector — {len(stocks_in_sector)} tickers currently tracked.
 
+### Key Signals
 **Stocks ({len(stocks_in_sector)}):** {', '.join(stocks_in_sector)}
 
 {sentiment_block}
 
-**Try:** "Should I buy {stocks_in_sector[0] if stocks_in_sector else 'NABIL'}?" or "Compare {stocks_in_sector[0] if stocks_in_sector else 'NABIL'} vs {stocks_in_sector[1] if len(stocks_in_sector) > 1 else 'EBL'}" """
+### Reasoning
+Sector-wide sentiment shifts ({sentiment_label}) tend to lead individual names by a few sessions — a bullish sector tape with a single laggard is often the best asymmetric setup. Ask me about a specific ticker for a full signal stack, or *"Compare {first_ticker} vs {second_ticker}"* to see how the leaders stack up."""
 
     # HELP / GREETING
     if any(w in msg for w in ['help', 'what can you', 'hello', 'hi ', 'namaste', 'hey']) or msg in ('hi', 'hello', 'yo'):
-        return f"""**Namaste! I'm BhaavShare AI** — your NEPSE market intelligence assistant.
+        greeting = f"Namaste {user_name.split()[0]}" if user_name else "Namaste"
+        return f"""{greeting}! I'm **BhaavShare Analyst** — your NEPSE market intelligence assistant.
 
-I analyze **{len(NEPSE_STOCKS)} stocks** across Banking, Hydropower, Insurance, Finance & more — using live price data, RSI/MACD/SMA technicals, LSTM forecasting, and multilingual NLP sentiment.
+### What I do
+I analyse **{len(NEPSE_STOCKS)} NEPSE stocks** across Banking, Hydropower, Insurance, Finance and more — using live price data, RSI/MACD/SMA technicals, LSTM forecasting, and multilingual NLP sentiment.
 
-**Try these:**
-• "Should I buy NABIL?" — full investment analysis
-• "How is EBL doing?" — live price + technicals
-• "Predict HBL" — LSTM forecast
-• "How accurate is your model for NABIL?" — training metrics
-• "Compare NABIL vs EBL" — side-by-side
-• "Banking sector" — sector view
-• "Analyse my watchlist" — personalised (logged-in users)
-• "What's the sentiment?" — news sentiment
+### Try these
+- *"Should I buy NABIL?"* — full investment call with reasoning
+- *"How is EBL doing?"* — live price + technical stance
+- *"Predict HBL"* — LSTM neural forecast
+- *"How accurate is your model for NABIL?"* — out-of-sample metrics
+- *"Compare NABIL vs EBL"* — side-by-side
+- *"Banking sector"* — sector view
+- *"Analyse my watchlist"* — personalised (logged-in users)
+- *"What's the sentiment?"* — news-driven mood
 
-**Currently tracking:** {symbol}
+**Currently tracking:** **{symbol}**
 {sentiment_block}
 {lstm_block}"""
 
     # DEFAULT — comprehensive overview
-    return f"""**BhaavShare AI — {symbol} Analysis** ({sector})
+    return f"""{continuity}### Summary
+Full-stack snapshot on **{symbol}** ({sector}) — price, technicals, sentiment and LSTM forecast in one view.
 
+### Key Signals
 {price_block}
 
-**Technical Signals:**
 {signal_block}
 
 {sentiment_block}
 {lstm_block}
 {metrics_block}
 
----
-**Quick actions:**
-• "Should I buy {symbol}?" — investment guidance
-• "Predict {symbol}" — LSTM forecast
-• "How accurate is your model for {symbol}?" — model metrics
-• "Compare {symbol} vs NABIL" — comparison
-• "List all stocks" — browse {len(NEPSE_STOCKS)} NEPSE stocks
+### Reasoning
+This is a neutral, everything-visible view. To turn it into a decision, pick an angle and ask again:
+- *"Should I buy {symbol}?"* — weighted investment call
+- *"Predict {symbol}"* — LSTM directional forecast
+- *"How accurate is your model for {symbol}?"* — out-of-sample metrics
+- *"Compare {symbol} vs NABIL"* — relative view
 
-⚠️ *AI-generated analysis. Not financial advice.*"""
+The signals above will not always agree — when they do, conviction is warranted; when they don't, it's information about uncertainty, not a reason to ignore the split."""

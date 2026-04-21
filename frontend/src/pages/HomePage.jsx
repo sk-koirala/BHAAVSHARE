@@ -1,8 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import {
   TrendingUp, TrendingDown, BarChart3, Brain, Newspaper, ArrowRight,
-  Zap, Shield, Globe, ChevronRight, Activity, Cpu,
+  Zap, Shield, Globe, ChevronRight, Activity, Cpu, ChevronLeft,
 } from 'lucide-react';
 import {
   ResponsiveContainer, AreaChart, Area, PieChart, Pie, Cell, Tooltip,
@@ -64,29 +64,9 @@ export default function HomePage() {
 
   return (
     <div className="min-h-screen bg-slate-50">
-      {/* HERO */}
-      <section className="relative pt-28 pb-16 px-4 sm:px-6 bg-white border-b border-slate-100">
-        <div className="max-w-5xl mx-auto text-center">
-          <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-blue-50 border border-blue-100 rounded-full text-blue-600 text-xs font-semibold mb-6">
-            <Activity size={12} /> AI-Powered NEPSE Intelligence
-          </div>
-          <h1 className="text-4xl sm:text-5xl md:text-6xl font-extrabold leading-tight mb-5 text-slate-900">
-            Smart Analysis for{' '}
-            <span className="text-blue-600">NEPSE Stocks</span>
-          </h1>
-          <p className="text-lg text-slate-500 max-w-2xl mx-auto mb-8 leading-relaxed">
-            Deep learning predictions, real-time sentiment analysis, and intelligent market insights — all in one platform built for Nepal's stock market.
-          </p>
-          <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
-            <Link to="/stocks" className="group flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-7 py-3.5 rounded-lg font-semibold transition-colors shadow-sm btn-press">
-              Explore Stocks <ArrowRight size={18} className="group-hover:translate-x-0.5 transition-transform" />
-            </Link>
-            <Link to="/ai" className="flex items-center gap-2 border border-slate-200 hover:border-slate-300 text-slate-700 hover:text-slate-900 px-7 py-3.5 rounded-lg font-semibold transition-colors bg-white btn-press">
-              Try AI Assistant
-            </Link>
-          </div>
-        </div>
-      </section>
+      {/* HERO SLIDER */}
+      <HeroSlider index={index} gainers={gainers} losers={losers} news={news} indexSeries={indexSeries} />
+
 
       {/* LIVE TICKER */}
       <section className="border-b border-slate-200 bg-white overflow-hidden">
@@ -253,7 +233,7 @@ export default function HomePage() {
         <div className="max-w-6xl mx-auto">
           <div className="text-center mb-12">
             <h2 className="text-2xl md:text-3xl font-bold text-slate-900 mb-2">Everything You Need</h2>
-            <p className="text-slate-500 max-w-xl mx-auto">Built from scratch with PyTorch, FastAPI, and React — no shortcuts.</p>
+            <p className="text-slate-500 max-w-xl mx-auto">Deep learning, multilingual NLP, and real-time data — one platform for NEPSE.</p>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
             {FEATURES.map((f, i) => (
@@ -282,6 +262,168 @@ export default function HomePage() {
           </Link>
         </div>
       </section>
+    </div>
+  );
+}
+
+function HeroSlider({ index, gainers, losers, news, indexSeries }) {
+  const topGainer = gainers?.[0];
+  const topLoser = losers?.[0];
+  const topNews = news?.[0];
+  const hasIndex = !!index?.value;
+  const idxUp = (index?.change_pct || 0) >= 0;
+
+  const slides = [
+    {
+      key: 'pulse',
+      eyebrow: 'LIVE MARKET PULSE',
+      title: 'BhaavShare Composite',
+      valueBig: hasIndex ? index.value.toFixed(2) : '—',
+      deltaPct: index?.change_pct || 0,
+      subtitle: `Tracking ${index?.components || 24} NEPSE tickers in real time.`,
+      cta: { to: '/stocks', label: 'Explore all stocks' },
+      accent: idxUp ? 'from-emerald-600 via-emerald-700 to-slate-900' : 'from-rose-600 via-rose-700 to-slate-900',
+      chart: indexSeries,
+    },
+    {
+      key: 'mover',
+      eyebrow: 'TOP MOVER TODAY',
+      title: topGainer?.symbol || 'Scanning…',
+      valueBig: topGainer ? `NPR ${(topGainer.latest_close || 0).toFixed(2)}` : '—',
+      deltaPct: topGainer?.change_pct || 0,
+      subtitle: topGainer ? `${topGainer.sector || 'Equity'} · leading gainers with strong momentum.` : 'Computing leaders…',
+      cta: topGainer ? { to: `/stocks/${topGainer.symbol}`, label: 'Open chart' } : { to: '/stocks', label: 'Explore stocks' },
+      accent: 'from-blue-600 via-indigo-700 to-slate-900',
+      chart: indexSeries,
+    },
+    {
+      key: 'loser',
+      eyebrow: 'UNDER PRESSURE',
+      title: topLoser?.symbol || 'Scanning…',
+      valueBig: topLoser ? `NPR ${(topLoser.latest_close || 0).toFixed(2)}` : '—',
+      deltaPct: topLoser?.change_pct || 0,
+      subtitle: topLoser ? `${topLoser.sector || 'Equity'} · biggest drawdown in the session.` : 'Computing laggards…',
+      cta: topLoser ? { to: `/stocks/${topLoser.symbol}`, label: 'Analyze signal' } : { to: '/ai', label: 'Ask AI' },
+      accent: 'from-rose-600 via-rose-700 to-slate-900',
+      chart: indexSeries,
+    },
+    {
+      key: 'news',
+      eyebrow: 'BREAKING HEADLINE',
+      title: topNews?.title?.slice(0, 90) || 'Fetching news…',
+      valueBig: null,
+      deltaPct: null,
+      subtitle: topNews ? `${topNews.source || 'Market wire'} · sentiment ${topNews.sentiment_label || 'neutral'}` : 'Connecting to 27+ sources…',
+      cta: { to: '/news', label: 'Read all news' },
+      accent: 'from-slate-800 via-slate-900 to-blue-950',
+      chart: null,
+    },
+  ];
+
+  const [i, setI] = useState(0);
+  const timer = useRef(null);
+  const count = slides.length;
+
+  const go = useCallback((n) => setI(((n % count) + count) % count), [count]);
+  const next = useCallback(() => go(i + 1), [go, i]);
+  const prev = useCallback(() => go(i - 1), [go, i]);
+
+  useEffect(() => {
+    timer.current = setInterval(() => setI(p => (p + 1) % count), 5500);
+    return () => clearInterval(timer.current);
+  }, [count]);
+
+  const pause = () => clearInterval(timer.current);
+  const resume = () => { timer.current = setInterval(() => setI(p => (p + 1) % count), 5500); };
+
+  return (
+    <section className="relative pt-20" onMouseEnter={pause} onMouseLeave={resume}>
+      <div className="relative overflow-hidden">
+        <div className="flex transition-transform duration-700 ease-out" style={{ transform: `translateX(-${i * 100}%)` }}>
+          {slides.map((s) => <HeroSlide key={s.key} {...s} />)}
+        </div>
+
+        <button onClick={prev} aria-label="Previous" className="absolute left-3 md:left-6 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 backdrop-blur border border-white/20 text-white flex items-center justify-center transition btn-press">
+          <ChevronLeft size={18} />
+        </button>
+        <button onClick={next} aria-label="Next" className="absolute right-3 md:right-6 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 backdrop-blur border border-white/20 text-white flex items-center justify-center transition btn-press">
+          <ChevronRight size={18} />
+        </button>
+
+        <div className="absolute bottom-5 left-0 right-0 flex items-center justify-center gap-2">
+          {slides.map((_, k) => (
+            <button key={k} onClick={() => go(k)} aria-label={`Slide ${k + 1}`}
+              className={`h-1.5 rounded-full transition-all ${k === i ? 'w-8 bg-white' : 'w-2.5 bg-white/40 hover:bg-white/60'}`} />
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function HeroSlide({ eyebrow, title, valueBig, deltaPct, subtitle, cta, accent, chart }) {
+  const up = (deltaPct || 0) >= 0;
+  return (
+    <div className="w-full shrink-0">
+      <div className={`relative bg-gradient-to-br ${accent} px-6 md:px-12 py-16 md:py-24 overflow-hidden`}>
+        {/* animated grid */}
+        <div className="absolute inset-0 opacity-[0.08]" style={{
+          backgroundImage: 'linear-gradient(rgba(255,255,255,.6) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.6) 1px, transparent 1px)',
+          backgroundSize: '44px 44px',
+        }} />
+        <div className="absolute -top-20 -right-20 w-80 h-80 rounded-full bg-white/5 blur-3xl animate-pulse" />
+        <div className="absolute -bottom-24 -left-24 w-96 h-96 rounded-full bg-white/5 blur-3xl" />
+
+        <div className="relative max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-5 gap-8 items-center">
+          <div className="md:col-span-3 text-white">
+            <div className="inline-flex items-center gap-2 px-3 py-1 bg-white/10 backdrop-blur border border-white/15 rounded-full text-[11px] font-semibold tracking-wider text-white/90 mb-5">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-white" />
+              </span>
+              {eyebrow}
+            </div>
+            <h1 className="text-3xl md:text-5xl font-extrabold leading-tight mb-4 [text-wrap:balance]">{title}</h1>
+            {valueBig && (
+              <div className="flex items-end gap-3 mb-4">
+                <div className="text-4xl md:text-5xl font-mono font-bold tracking-tight">{valueBig}</div>
+                {deltaPct != null && (
+                  <div className={`px-2.5 py-1 rounded-lg text-sm font-semibold ${up ? 'bg-emerald-400/20 text-emerald-200' : 'bg-rose-400/20 text-rose-200'}`}>
+                    {up ? '▲' : '▼'} {Math.abs(deltaPct).toFixed(2)}%
+                  </div>
+                )}
+              </div>
+            )}
+            <p className="text-white/70 text-base md:text-lg max-w-xl mb-7 leading-relaxed">{subtitle}</p>
+            <div className="flex flex-col sm:flex-row gap-3">
+              <Link to={cta.to} className="group inline-flex items-center gap-2 bg-white text-slate-900 hover:bg-slate-100 px-6 py-3 rounded-lg font-semibold transition shadow-lg btn-press">
+                {cta.label} <ArrowRight size={16} className="group-hover:translate-x-0.5 transition-transform" />
+              </Link>
+              <Link to="/ai" className="inline-flex items-center gap-2 border border-white/25 hover:border-white/50 text-white hover:bg-white/5 px-6 py-3 rounded-lg font-semibold transition btn-press">
+                Ask AI Assistant
+              </Link>
+            </div>
+          </div>
+
+          <div className="md:col-span-2 hidden md:block">
+            {chart && (
+              <div className="bg-white/5 backdrop-blur border border-white/10 rounded-2xl p-4 h-56">
+                <ResponsiveContainer>
+                  <AreaChart data={chart}>
+                    <defs>
+                      <linearGradient id="heroFill" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#fff" stopOpacity={0.35} />
+                        <stop offset="95%" stopColor="#fff" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <Area type="monotone" dataKey="v" stroke="#ffffff" strokeWidth={2} fill="url(#heroFill)" />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

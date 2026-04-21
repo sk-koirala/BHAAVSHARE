@@ -28,6 +28,11 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
     full_name: Optional[str] = Field(None, min_length=2, max_length=100)
+    phone: Optional[str] = Field(None, max_length=40)
+    location: Optional[str] = Field(None, max_length=100)
+    bio: Optional[str] = Field(None, max_length=500)
+    role: Optional[str] = Field("user", pattern=r"^(user|admin)$")
+    admin_code: Optional[str] = Field(None, max_length=120)
 
     @field_validator("password")
     @classmethod
@@ -44,6 +49,16 @@ class UserCreate(BaseModel):
             raise ValueError("Full name must be at least 2 characters.")
         if not re.match(r"^[A-Za-z\u0900-\u097F\s\.'-]+$", v):
             raise ValueError("Full name contains invalid characters.")
+        return v
+
+    @field_validator("phone")
+    @classmethod
+    def _check_phone(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v.strip() == "":
+            return None
+        v = v.strip()
+        if not re.match(r"^\+?[0-9\s\-()]{7,20}$", v):
+            raise ValueError("Phone number looks invalid.")
         return v
 
 

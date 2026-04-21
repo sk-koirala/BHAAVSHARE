@@ -30,19 +30,36 @@ export default function ContactPage() {
           <p className="text-slate-500 max-w-lg mx-auto">Have questions about BhaavShare or want to collaborate? We'd love to hear from you.</p>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-10">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-8">
           {[
-            { icon: <Mail size={20} />, title: "Email", detail: "hello@bhaavshare.com" },
-            { icon: <MapPin size={20} />, title: "Location", detail: "Kathmandu, Nepal" },
-            { icon: <Phone size={20} />, title: "Phone", detail: "+977 9843678924" },
+            { icon: <Mail size={20} />, title: "Email", detail: "Bhaavshare@gmail.com", href: "mailto:Bhaavshare@gmail.com" },
+            { icon: <MapPin size={20} />, title: "Location", detail: "Tokha, Nepal" },
+            { icon: <Phone size={20} />, title: "Phone", detail: "+977 9843678924", href: "tel:+9779843678924" },
             { icon: <Github size={20} />, title: "Data", detail: "Aabishkar2/nepse-data" },
-          ].map((c, i) => (
-            <div key={i} className="bg-white border border-slate-200 rounded-xl p-5 text-center hover:border-blue-200 transition card-hover">
-              <div className="w-11 h-11 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center mx-auto mb-3">{c.icon}</div>
-              <h3 className="text-slate-800 font-semibold text-sm">{c.title}</h3>
-              <p className="text-slate-500 text-sm mt-1">{c.detail}</p>
-            </div>
-          ))}
+          ].map((c, i) => {
+            const Tag = c.href ? 'a' : 'div';
+            return (
+              <Tag key={i} href={c.href} className="bg-white border border-slate-200 rounded-xl p-5 text-center hover:border-blue-200 transition card-hover block">
+                <div className="w-11 h-11 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center mx-auto mb-3">{c.icon}</div>
+                <h3 className="text-slate-800 font-semibold text-sm">{c.title}</h3>
+                <p className="text-slate-500 text-sm mt-1 break-all">{c.detail}</p>
+              </Tag>
+            );
+          })}
+        </div>
+
+        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-card mb-10">
+          <div className="flex items-center gap-2 px-5 py-3 border-b border-slate-100">
+            <MapPin size={16} className="text-blue-600" />
+            <span className="text-sm font-semibold text-slate-800">Find Us — Tokha, Nepal</span>
+          </div>
+          <iframe
+            title="BhaavShare Office — Tokha, Nepal"
+            src="https://www.google.com/maps?q=Tokha,Nepal&z=14&output=embed"
+            className="w-full h-72 border-0"
+            loading="lazy"
+            referrerPolicy="no-referrer-when-downgrade"
+          />
         </div>
 
         <div className="bg-white border border-slate-200 rounded-xl p-7 md:p-10 max-w-2xl mx-auto shadow-card relative">

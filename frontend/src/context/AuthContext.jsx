@@ -29,10 +29,10 @@ export function AuthProvider({ children }) {
     } finally { setLoading(false); }
   }, []);
 
-  const signup = useCallback(async (email, password, full_name) => {
+  const signup = useCallback(async (payload) => {
     setLoading(true);
     try {
-      const { data } = await api.post('/auth/signup', { email, password, full_name });
+      const { data } = await api.post('/auth/signup', payload);
       persist(data.access_token, data.user);
       return { ok: true };
     } catch (e) {

@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     # Admin bootstrap
     ADMIN_EMAIL: str = "admin@bhaavshare.com"
     ADMIN_PASSWORD: str = "admin123"
+    # Code required at signup to self-register as admin (role=admin).
+    # Anything else falls back to a regular user account.
+    ADMIN_SIGNUP_CODE: str = "BHAAV-ADMIN-2026"
 
     # OAuth — populated from .env; endpoints return 501 when left blank.
     GOOGLE_CLIENT_ID: str = ""
