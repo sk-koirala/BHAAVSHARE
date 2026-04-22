@@ -359,16 +359,19 @@ def market_overview_route():
 @router.post("/scrape/run")
 def trigger_scrape(
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
     admin: db_models.User = Depends(get_admin_user),  # 🔒 admin-only
 ):
     def run_pipeline():
+        # Use an independent session — the request-scoped one is closed
+        # by FastAPI as soon as the response is sent.
+        from app.db.database import SessionLocal
+        bg_db = SessionLocal()
         try:
             raw_news = scrape_all_news()
             processed_news = process_news_batch(raw_news)
             for item in processed_news:
                 try:
-                    exists = db.query(db_models.NewsItem).filter(db_models.NewsItem.url == item['url']).first()
+                    exists = bg_db.query(db_models.NewsItem).filter(db_models.NewsItem.url == item['url']).first()
                     if not exists:
                         db_item = db_models.NewsItem(
                             title=item.get('title', ''),
@@ -381,12 +384,14 @@ def trigger_scrape(
                             sentiment_label=item.get('sentiment_label'),
                             sentiment_score=item.get('sentiment_score'),
                         )
-                        db.add(db_item)
+                        bg_db.add(db_item)
                 except Exception:
                     continue
-            db.commit()
+            bg_db.commit()
         except Exception:
-            db.rollback()
+            bg_db.rollback()
+        finally:
+            bg_db.close()
 
     background_tasks.add_task(run_pipeline)
     return {"message": "Scraping and NLP pipeline started in background by admin."}
@@ -422,9 +427,6 @@ def get_news(
     if source_type:
         q = q.filter(db_models.NewsItem.source_type == source_type)
     news = q.order_by(db_models.NewsItem.published_at.desc()).offset(skip).limit(limit).all()
-    if not news:
-        raw = scrape_all_news()
-        return process_news_batch(raw)
     return news
 
 

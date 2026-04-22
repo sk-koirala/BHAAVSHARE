@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -35,7 +36,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Paths & constants
 # ---------------------------------------------------------------------------
-MODEL_DIR = Path("/app/data/models")
+def _resolve_model_dir() -> Path:
+    env = os.getenv("MODEL_DIR")
+    if env:
+        return Path(env)
+    docker_path = Path("/app/data/models")
+    if docker_path.is_dir() and any(docker_path.glob("*.pth")):
+        return docker_path
+    return Path(__file__).resolve().parents[3] / "data" / "models"
+
+
+MODEL_DIR = _resolve_model_dir()
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 WINDOW_SIZE = 30

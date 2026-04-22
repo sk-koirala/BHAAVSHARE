@@ -167,10 +167,12 @@ def _start_scheduler():
         finally:
             db.close()
 
+    from datetime import datetime, timedelta
     scheduler.add_job(_validate_job, 'cron', hour=0, minute=10, id='validate_predictions')
-    scheduler.add_job(_scrape_job, 'interval', hours=4, id='scrape_news')
+    scheduler.add_job(_scrape_job, 'interval', hours=4, id='scrape_news',
+                      next_run_time=datetime.now() + timedelta(seconds=10))
     scheduler.start()
-    logger.info("Background scheduler started: prediction validation @00:10, news scraping every 4h.")
+    logger.info("Background scheduler started: prediction validation @00:10, news scraping every 4h (first run in 10s).")
 
 
 @asynccontextmanager
